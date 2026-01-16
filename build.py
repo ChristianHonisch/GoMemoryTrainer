@@ -36,7 +36,7 @@ def build_executable():
         "--windowed",                   # No console window
         "--name", "GoMemoryTrainer",    # Output name
         "--distpath", str(project_dir / "dist"),
-        "--buildpath", str(project_dir / "build"),
+        "--workpath", str(project_dir / "build"),
         "--specpath", str(project_dir),
         str(trainer_file)
     ]

@@ -34,7 +34,7 @@ python -m PyInstaller `
     --windowed `
     --name "GoMemoryTrainer" `
     --distpath $distPath `
-    --buildpath $buildPath `
+    --workpath $buildPath `
     --specpath $specPath `
     $trainerFile
 
