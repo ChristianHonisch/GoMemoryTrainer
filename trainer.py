@@ -3,6 +3,12 @@ import random
 from enum import Enum
 from functools import partial
 from collections import deque
+import base64
+import csv
+import os
+import time
+from pathlib import Path
+from tkinter import simpledialog
 
 DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # up, down, left, right
 DIRECTIONS_DIAGONAL = DIRECTIONS + [(-1, -1), (-1, 1), (1, -1), (1, 1)]
@@ -55,6 +61,8 @@ class GoMemoryTrainer:
         self.board_size = 9
         self.num_random_stones = 6
         self.show_time_sec = 0
+        self.delay_before_input_sec = 0
+        self.username = "default"
 
         self.cell_size = 50
         self.margin = 40
@@ -65,11 +73,16 @@ class GoMemoryTrainer:
         self.current_player = Stone.BLACK
 
         self.hide_timer_id = None
+        self.delay_timer_id = None
         self.remaining_time = 0
+        self.remaining_delay = 0
         self.score = 0
 
         self.original_state = []
         self.user_state = []
+        
+        self.trial_epoch = None
+        self.time_used = 0.0
 
         self._build_controls()
         self._build_canvas()
@@ -90,9 +103,24 @@ class GoMemoryTrainer:
             e.pack()
             return e
 
+        # User selection dropdown
+        user_frame = tk.Frame(top)
+        user_frame.pack(side=tk.LEFT, padx=4)
+        tk.Label(user_frame, text="User").pack()
+        
+        self.existing_users = load_existing_users()
+        self.user_var = tk.StringVar(value=self.existing_users[0])
+        self.user_dropdown = tk.OptionMenu(user_frame, self.user_var, *self.existing_users, command=self._on_user_changed)
+        self.user_dropdown.pack(side=tk.LEFT)
+        
+        # Add new user button
+        add_user_btn = tk.Button(user_frame, text="+ Add", width=5, command=self._add_new_user)
+        add_user_btn.pack(side=tk.LEFT, padx=2)
+
         self.board_size_entry = labeled_entry("Board", self.board_size)
         self.stones_entry = labeled_entry("Stones", self.num_random_stones)
         self.timer_entry = labeled_entry("Time (s)", self.show_time_sec)
+        self.delay_entry = labeled_entry("Delay (s)", self.delay_before_input_sec)
 
         self.time_label = tk.Label(self.root, text="Time: –")
         self.time_label.pack()
@@ -138,6 +166,44 @@ class GoMemoryTrainer:
 
         self._set_mode("alternating")
 
+    def _on_user_changed(self, value):
+        """Handle user selection change."""
+        self.username = value
+
+    def _add_new_user(self):
+        """Open dialog to add a new user."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add New User")
+        dialog.geometry("300x100")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        tk.Label(dialog, text="Username:").pack(pady=5)
+        entry = tk.Entry(dialog, width=30)
+        entry.pack(pady=5)
+        entry.focus()
+        
+        def save_user():
+            new_username = entry.get().strip()
+            if new_username and new_username not in self.existing_users:
+                self.existing_users.append(new_username)
+                self.existing_users.sort()
+                
+                # Recreate dropdown with new user
+                self.user_dropdown['menu'].delete(0, 'end')
+                for user in self.existing_users:
+                    self.user_dropdown['menu'].add_command(
+                        label=user,
+                        command=partial(self._on_user_changed, user)
+                    )
+                    self.user_var.set(user)
+                
+                # Ensure CSV file exists for new user
+                ensure_csv_headers(new_username)
+                dialog.destroy()
+        
+        tk.Button(dialog, text="OK", command=save_user).pack(pady=5)
+
     def _build_canvas(self):
         self.canvas = tk.Canvas(self.root, bg=COLORS["board"])
         self.canvas.pack()
@@ -156,7 +222,11 @@ class GoMemoryTrainer:
             self.done_button.config(state=tk.DISABLED)
             self.hide_button.config(state=tk.NORMAL)
         elif self.phase == Phase.INPUT:
-            self.done_button.config(state=tk.NORMAL)
+            # Disable input buttons if delay is active
+            if self.remaining_delay > 0:
+                self.done_button.config(state=tk.DISABLED)
+            else:
+                self.done_button.config(state=tk.NORMAL)
             self.hide_button.config(state=tk.DISABLED)
         else:  # DONE
             self.done_button.config(state=tk.DISABLED)
@@ -168,10 +238,13 @@ class GoMemoryTrainer:
         self.board_size = max(5, int(self.board_size_entry.get()))
         self.num_random_stones = max(0, int(self.stones_entry.get()))
         self.show_time_sec = max(0, int(self.timer_entry.get()))
+        self.delay_before_input_sec = max(0, int(self.delay_entry.get()))
 
     def _reset_game(self):
         if self.hide_timer_id:
             self.root.after_cancel(self.hide_timer_id)
+        if self.delay_timer_id:
+            self.root.after_cancel(self.delay_timer_id)
 
         self._read_parameters()
 
@@ -182,6 +255,7 @@ class GoMemoryTrainer:
 
         self.phase = Phase.SHOWING
         self.remaining_time = self.show_time_sec
+        self.remaining_delay = 0
 
         self._update_button_states()
         self.current_player = Stone.BLACK
@@ -193,6 +267,9 @@ class GoMemoryTrainer:
         self._generate_random_position()
         self.difficulty = estimate_difficulty(self.original_state)
         self.difficulty_label.config(text=f"Difficulty: {self.difficulty:.2f}")
+
+        self.trial_epoch = time.time()
+        self.time_used = 0.0
 
         self._draw()
 
@@ -337,7 +414,7 @@ class GoMemoryTrainer:
     # ---------- Interaction ----------
 
     def _on_click(self, event):
-        if self.phase != Phase.INPUT:
+        if self.phase != Phase.INPUT or not self._is_input_allowed():
             return
 
         row, col = self._get_board_coords(event.x, event.y)
@@ -364,7 +441,7 @@ class GoMemoryTrainer:
         self._draw()
 
     def _on_right_click(self, event):
-        if self.phase != Phase.INPUT:
+        if self.phase != Phase.INPUT or not self._is_input_allowed():
             return
 
         row, col = self._get_board_coords(event.x, event.y)
@@ -378,18 +455,184 @@ class GoMemoryTrainer:
 
     def _hide_board(self):
         self.phase = Phase.INPUT
+        self.time_used = time.time() - self.trial_epoch
         self._update_button_states()
+        
+        # Start delay timer if configured
+        if self.delay_before_input_sec > 0:
+            self.remaining_delay = self.delay_before_input_sec
+            self._update_delay_timer()
+        
         self._draw()
+
+    def _update_delay_timer(self):
+        """Update the countdown timer before user can input."""
+        if self.phase != Phase.INPUT:
+            return
+
+        self.time_label.config(text=f"Wait: {self.remaining_delay}s")
+
+        if self.remaining_delay <= 0:
+            self.time_label.config(text="Time: –")
+            self._update_button_states()
+            return
+
+        self.remaining_delay -= 1
+        self.delay_timer_id = self.root.after(1000, self._update_delay_timer)
+
+    def _is_input_allowed(self) -> bool:
+        """Check if user input is currently allowed."""
+        if self.phase != Phase.INPUT:
+            return False
+        return self.remaining_delay <= 0
 
     def _finish(self):
         self.phase = Phase.DONE
         self._update_button_states()
         self.score = score_position(self.original_state, self.user_state)
         self.score_label.config(text=f"Score: {self.score}")
+        
+        # Save trial data to CSV
+        original_b64 = board_to_base64(self.original_state)
+        user_b64 = board_to_base64(self.user_state)
+        
+        save_trial(
+            username=self.username,
+            epoch=self.trial_epoch,
+            board_size=self.board_size,
+            stones=self.num_random_stones,
+            original_b64=original_b64,
+            user_b64=user_b64,
+            show_time=self.show_time_sec,
+            time_used=self.time_used,
+            score=self.score,
+            difficulty=self.difficulty
+        )
+        
         self._draw()
 
     def run(self):
         self.root.mainloop()
+
+
+# ---------- Board encoding/decoding ----------
+
+def board_to_base64(board) -> str:
+    """Encode board state to base64 string using 2 bits per cell.
+    
+    Each cell needs 2 bits:
+    - 00 = EMPTY (0)
+    - 01 = BLACK (1)
+    - 10 = WHITE (2)
+    Packs 4 cells per byte.
+    """
+    size = len(board)
+    data = bytearray([size])  # first byte is board size
+    
+    # Pack cells into bytes (4 cells per byte)
+    cells_flat = []
+    for row in board:
+        for cell in row:
+            cells_flat.append(cell.value)
+    
+    for i in range(0, len(cells_flat), 4):
+        byte_val = 0
+        for j in range(4):
+            if i + j < len(cells_flat):
+                byte_val |= (cells_flat[i + j] & 0x3) << (j * 2)
+        data.append(byte_val)
+    
+    return base64.b64encode(data).decode('ascii')
+
+
+def base64_to_board(encoded: str):
+    """Decode base64 string back to board state (2 bits per cell)."""
+    data = base64.b64decode(encoded.encode('ascii'))
+    size = data[0]
+    board = []
+    
+    # Unpack bytes into cells (4 cells per byte)
+    cells_flat = []
+    for i in range(1, len(data)):
+        byte_val = data[i]
+        for j in range(4):
+            cell_val = (byte_val >> (j * 2)) & 0x3
+            cells_flat.append(Stone(cell_val))
+    
+    # Reconstruct board
+    idx = 0
+    for _ in range(size):
+        row = []
+        for _ in range(size):
+            if idx < len(cells_flat):
+                row.append(cells_flat[idx])
+                idx += 1
+        board.append(row)
+    
+    return board
+
+
+# ---------- CSV file management ----------
+
+def get_trials_dir():
+    """Get or create the trials directory."""
+    trials_dir = Path("trials")
+    trials_dir.mkdir(exist_ok=True)
+    return trials_dir
+
+
+def get_user_csv_path(username: str) -> Path:
+    """Get the CSV file path for a specific user."""
+    return get_trials_dir() / f"{username}.csv"
+
+
+def load_existing_users() -> list:
+    """Scan trials directory and return list of existing users."""
+    trials_dir = get_trials_dir()
+    users = []
+    
+    if trials_dir.exists():
+        for csv_file in trials_dir.glob("*.csv"):
+            username = csv_file.stem
+            users.append(username)
+    
+    # Always include default
+    if "default" not in users:
+        users.insert(0, "default")
+    else:
+        users.remove("default")
+        users.insert(0, "default")
+    
+    return sorted(users)
+
+
+def ensure_csv_headers(username: str):
+    """Create CSV file with headers if it doesn't exist."""
+    csv_path = get_user_csv_path(username)
+    
+    if not csv_path.exists():
+        headers = [
+            "epoch", "board_size", "stones", "original_b64", "user_b64",
+            "show_time", "time_used", "score", "difficulty"
+        ]
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+
+def save_trial(username: str, epoch: float, board_size: int, stones: int,
+               original_b64: str, user_b64: str, show_time: int, time_used: float,
+               score: int, difficulty: float):
+    """Save a single trial to the user's CSV file."""
+    ensure_csv_headers(username)
+    csv_path = get_user_csv_path(username)
+    
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            epoch, board_size, stones, original_b64, user_b64,
+            show_time, time_used, score, difficulty
+        ])
 
 
 # ---------- Evaluation helpers ----------
