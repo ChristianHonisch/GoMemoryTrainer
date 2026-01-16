@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go-memory-trainer"
+version = "1.0.0"
+description = "A Go memory training application for improving pattern recognition"
+authors = [{name = "Your Name"}]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.1.0"]
+
+[tool.setuptools]
+packages = []
