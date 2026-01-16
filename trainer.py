@@ -2,6 +2,23 @@ import tkinter as tk
 import random
 from enum import Enum
 from functools import partial
+from collections import deque
+
+DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # up, down, left, right
+DIRECTIONS_DIAGONAL = DIRECTIONS + [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+
+COLORS = {
+    "black": "black",
+    "white": "white",
+    "black_missing": "#555555",
+    "white_missing": "#EAEAE0",
+    "board": "#DEB887",
+    "grid": "black",
+}
+
+STONE_RADIUS_FACTOR = 0.45
+HOSHI_RADIUS = 5
+EVALUATION_FONT = ("Arial", 24, "bold")
 
 
 class Stone(Enum):
@@ -36,11 +53,12 @@ class GoMemoryTrainer:
         self.root.title("Go Memory Trainer")
 
         self.board_size = 9
-        self.num_random_stones = 12
-        self.show_time_sec = 5
+        self.num_random_stones = 6
+        self.show_time_sec = 0
 
         self.cell_size = 50
         self.margin = 40
+        self.stone_radius = self.cell_size * STONE_RADIUS_FACTOR
 
         self.phase = Phase.SHOWING
         self.placement_mode = "alternating"
@@ -81,6 +99,8 @@ class GoMemoryTrainer:
 
         self.score_label = tk.Label(self.root, text="Score: –")
         self.score_label.pack()
+        self.difficulty_label = tk.Label(self.root, text="Difficulty: –")
+        self.difficulty_label.pack()
 
         modes = tk.Frame(self.root)
         modes.pack(pady=4)
@@ -116,10 +136,10 @@ class GoMemoryTrainer:
         )
         self.reset_button.pack(side=tk.LEFT)
 
-        self._set_mode("alternating") ## not sure if theis is the right location
+        self._set_mode("alternating")
 
     def _build_canvas(self):
-        self.canvas = tk.Canvas(self.root, bg="#DEB887")
+        self.canvas = tk.Canvas(self.root, bg=COLORS["board"])
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Button-3>", self._on_right_click)
@@ -161,17 +181,23 @@ class GoMemoryTrainer:
         self.canvas.config(width=self.canvas_size, height=self.canvas_size)
 
         self.phase = Phase.SHOWING
+        self.remaining_time = self.show_time_sec
+
         self._update_button_states()
         self.current_player = Stone.BLACK
-        self.remaining_time = self.show_time_sec
         self.score = 0
 
         self.original_state = self._empty_state()
         self.user_state = self._empty_state()
 
         self._generate_random_position()
+        self.difficulty = estimate_difficulty(self.original_state)
+        self.difficulty_label.config(text=f"Difficulty: {self.difficulty:.2f}")
+
         self._draw()
-        self._update_timer()
+
+        if self.show_time_sec != 0:
+            self._update_timer()
 
     def _empty_state(self):
         return [
@@ -216,46 +242,21 @@ class GoMemoryTrainer:
             self._draw_result_view()
 
     def _draw_result_view(self):
-        """
-        Draws:
-        - User stones
-        - Missing stones (ghosted)
-        - Evaluation symbols
-        """
-        r = self.cell_size * 0.45
-
-        # --- Draw stones (user + missing originals) ---
+        """Draw user stones, missing stones (ghosted), and evaluation symbols."""
         for row in range(self.board_size):
             for col in range(self.board_size):
                 u = self.user_state[row][col]
                 o = self.original_state[row][col]
-
-                cx = self.margin + col * self.cell_size
-                cy = self.margin + row * self.cell_size
+                cx, cy = self._get_canvas_coords(row, col)
 
                 if u != Stone.EMPTY:
-                    color = "black" if u == Stone.BLACK else "white"
-                    self.canvas.create_oval(
-                        cx - r, cy - r,
-                        cx + r, cy + r,
-                        fill=color,
-                        outline="black",
-                        width=2,
-                    )
-
+                    color = COLORS["black"] if u == Stone.BLACK else COLORS["white"]
+                    self._draw_single_stone(cx, cy, color)
                 elif o != Stone.EMPTY:
-                    # Missing stone
-                    self.canvas.create_oval(
-                        cx - r, cy - r,
-                        cx + r, cy + r,
-                        fill=MISSING_COLORS[o],
-                        outline="black",
-                        width=1,
-                    )
+                    color = COLORS["black_missing"] if o == Stone.BLACK else COLORS["white_missing"]
+                    self._draw_single_stone(cx, cy, color)
 
-        # --- Draw evaluation symbols for user stones only ---
         self._draw_evaluation()
-
 
     def _draw_grid(self):
         for i in range(self.board_size):
@@ -272,47 +273,66 @@ class GoMemoryTrainer:
         if self.board_size not in hoshi_map:
             return
 
-        r = 4
         for i in hoshi_map[self.board_size]:
             for j in hoshi_map[self.board_size]:
-                x = self.margin + j * self.cell_size
-                y = self.margin + i * self.cell_size
-                self.canvas.create_oval(x - r, y - r, x + r, y + r, fill="black")
+                cx, cy = self._get_canvas_coords(i, j)
+                self.canvas.create_oval(
+                    cx - HOSHI_RADIUS, cy - HOSHI_RADIUS,
+                    cx + HOSHI_RADIUS, cy + HOSHI_RADIUS,
+                    fill="black"
+                )
 
     def _draw_stones(self, state):
-        r = self.cell_size * 0.45
         for i in range(self.board_size):
             for j in range(self.board_size):
                 s = state[i][j]
                 if s == Stone.EMPTY:
                     continue
-                cx = self.margin + j * self.cell_size
-                cy = self.margin + i * self.cell_size
-                color = "black" if s == Stone.BLACK else "white"
-                self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                        fill=color, outline="black", width=2)
+                cx, cy = self._get_canvas_coords(i, j)
+                color = COLORS["black"] if s == Stone.BLACK else COLORS["white"]
+                self._draw_single_stone(cx, cy, color)
+
+    def _draw_single_stone(self, cx, cy, color):
+        """Draw a single stone at canvas coordinates."""
+        self.canvas.create_oval(
+            cx - self.stone_radius, cy - self.stone_radius,
+            cx + self.stone_radius, cy + self.stone_radius,
+            fill=color, outline="black", width=2,
+        )
 
     def _draw_evaluation(self):
         for r in range(self.board_size):
             for c in range(self.board_size):
-                u = self.user_state[r][c]
-                if u == Stone.EMPTY:
+                if self.user_state[r][c] == Stone.EMPTY:
                     continue
 
-                cx = self.margin + c * self.cell_size
-                cy = self.margin + r * self.cell_size
-
+                cx, cy = self._get_canvas_coords(r, c)
                 status = classify_stone(self.original_state, self.user_state, r, c)
 
                 if status == "correct":
                     text, color = "✓", "green"
                 elif status == "almost":
-                    text, color = "✚", "#B8860B"
+                    text, color = "o", "#B8860B"
                 else:
                     text, color = "✗", "red"
 
-                self.canvas.create_text(cx, cy, text=text, fill=color,
-                                        font=("Arial", 24, "bold"))
+                self.canvas.create_text(cx, cy, text=text, fill=color, font=EVALUATION_FONT)
+
+    def _get_canvas_coords(self, row, col):
+        """Convert board coordinates to canvas coordinates."""
+        cx = self.margin + col * self.cell_size
+        cy = self.margin + row * self.cell_size
+        return cx, cy
+
+    def _get_board_coords(self, event_x, event_y):
+        """Convert canvas coordinates to board coordinates."""
+        col = round((event_x - self.margin) / self.cell_size)
+        row = round((event_y - self.margin) / self.cell_size)
+        return row, col
+
+    def _is_valid_position(self, row, col):
+        """Check if position is within board bounds."""
+        return 0 <= row < self.board_size and 0 <= col < self.board_size
 
     # ---------- Interaction ----------
 
@@ -320,10 +340,9 @@ class GoMemoryTrainer:
         if self.phase != Phase.INPUT:
             return
 
-        col = round((event.x - self.margin) / self.cell_size)
-        row = round((event.y - self.margin) / self.cell_size)
+        row, col = self._get_board_coords(event.x, event.y)
 
-        if not (0 <= row < self.board_size and 0 <= col < self.board_size):
+        if not self._is_valid_position(row, col):
             return
 
         if self.placement_mode == "delete":
@@ -348,10 +367,9 @@ class GoMemoryTrainer:
         if self.phase != Phase.INPUT:
             return
 
-        col = round((event.x - self.margin) / self.cell_size)
-        row = round((event.y - self.margin) / self.cell_size)
+        row, col = self._get_board_coords(event.x, event.y)
 
-        if not (0 <= row < self.board_size and 0 <= col < self.board_size):
+        if not self._is_valid_position(row, col):
             return
 
         self.user_state[row][col] = Stone.EMPTY
@@ -384,10 +402,9 @@ def classify_stone(original, user, r, c):
         return "correct"
 
     if o != Stone.EMPTY and u != Stone.EMPTY:
-        # wrong color, right place
         return "almost"
 
-    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+    for dr, dc in DIRECTIONS:
         rr, cc = r + dr, c + dc
         if 0 <= rr < len(original) and 0 <= cc < len(original):
             if original[rr][cc] == u:
@@ -397,28 +414,144 @@ def classify_stone(original, user, r, c):
 
 
 def score_position(original, user) -> int:
-    score = 0
     size = len(original)
+    score = 0
 
     used_original = [[False]*size for _ in range(size)]
+    used_user = [[False]*size for _ in range(size)]
 
+    # 1. Exact matches (correct position + color)
     for r in range(size):
         for c in range(size):
-            u = user[r][c]
-            o = original[r][c]
+            if user[r][c] != Stone.EMPTY and user[r][c] == original[r][c]:
+                used_original[r][c] = True
+                used_user[r][c] = True
+                # 0 points for correct stone
 
-            if u == Stone.EMPTY and o != Stone.EMPTY:
+    # 2. Almost-correct matches
+    for r in range(size):
+        for c in range(size):
+            if used_user[r][c]:
+                continue
+            u = user[r][c]
+            if u == Stone.EMPTY:
+                continue
+
+            # Check same position, wrong color
+            if original[r][c] != Stone.EMPTY and not used_original[r][c]:
+                score -= 1
+                used_original[r][c] = True
+                used_user[r][c] = True
+                continue
+
+            # Check offset by one (Manhattan distance = 1)
+            for dr, dc in ((1,0), (-1,0), (0,1), (0,-1)):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < size and 0 <= cc < size:
+                    if (original[rr][cc] != Stone.EMPTY
+                        and not used_original[rr][cc]):
+                        score -= 1
+                        used_original[rr][cc] = True
+                        used_user[r][c] = True
+                        break
+
+    # 3. Missing stones
+    for r in range(size):
+        for c in range(size):
+            if original[r][c] != Stone.EMPTY and not used_original[r][c]:
                 score -= 2
-            elif u != Stone.EMPTY:
-                if u == o:
-                    score += 3
-                    used_original[r][c] = True
-                elif o != Stone.EMPTY:
-                    score += 1
-                else:
-                    score -= 2
+
+    # 4. Hallucinated stones
+    for r in range(size):
+        for c in range(size):
+            if user[r][c] != Stone.EMPTY and not used_user[r][c]:
+                score -= 2
 
     return score
+
+def estimate_difficulty(board) -> float:
+    size = len(board)
+
+    stones = [(r, c) for r in range(size) for c in range(size)
+              if board[r][c] != Stone.EMPTY]
+
+    N = len(stones)
+    if N == 0:
+        return 0.0
+
+    # ---- connected components ----
+    visited = [[False]*size for _ in range(size)]
+    clusters = []
+
+    for r, c in stones:
+        if visited[r][c]:
+            continue
+
+        queue = deque([(r, c)])
+        visited[r][c] = True
+        cluster = [(r, c)]
+
+        while queue:
+            rr, cc = queue.popleft()
+            for dr, dc in DIRECTIONS:
+                nr, nc = rr + dr, cc + dc
+                if (0 <= nr < size and 0 <= nc < size
+                    and not visited[nr][nc]
+                    and board[nr][nc] != Stone.EMPTY):
+                    visited[nr][nc] = True
+                    queue.append((nr, nc))
+                    cluster.append((nr, nc))
+
+        clusters.append(cluster)
+
+    num_clusters = len(clusters)
+    isolated_stones = sum(1 for c in clusters if len(c) == 1)
+    mean_cluster_size = N / num_clusters
+
+    # ---- bounding box ----
+    rows = [r for r, _ in stones]
+    cols = [c for _, c in stones]
+    bounding_box_area = (
+        (max(rows) - min(rows) + 1) *
+        (max(cols) - min(cols) + 1)
+    )
+
+    # ---- nearest neighbor distance ----
+    def manhattan(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    nn_distances = []
+    for i, p in enumerate(stones):
+        d = min(manhattan(p, q)
+                for j, q in enumerate(stones) if i != j)
+        nn_distances.append(d)
+
+    avg_nn_distance = sum(nn_distances) / len(nn_distances)
+
+    # ---- symmetry ----
+    sym = 0.0
+    if all(board[r][c] == board[size-1-r][c]
+           for r in range(size) for c in range(size)):
+        sym += 1
+    if all(board[r][c] == board[r][size-1-c]
+           for r in range(size) for c in range(size)):
+        sym += 1
+    if all(board[r][c] == board[size-1-r][size-1-c]
+           for r in range(size) for c in range(size)):
+        sym += 1
+    sym /= 3.0
+
+    difficulty = (
+        1.0 * N
+        + 2.0 * isolated_stones
+        + 1.5 * num_clusters
+        + 0.05 * bounding_box_area
+        + 1.0 * avg_nn_distance
+        - 3.0 * sym
+        - 2.0 * mean_cluster_size
+    )
+
+    return max(0.0, difficulty)
 
 
 if __name__ == "__main__":

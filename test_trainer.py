@@ -2,10 +2,11 @@
 test_trainer.py
 
 Developer test harness for GoMemoryTrainer.
-Allows explicit specification of original and user board positions
-and renders the result directly in DONE mode.
+Uses pytest for test discovery and reporting.
+Visual tests can be skipped with: pytest -m "not visual"
 """
 
+import pytest
 from trainer import (
     GoMemoryTrainer,
     Stone,
@@ -14,157 +15,157 @@ from trainer import (
 )
 
 
-# ---------- Helpers ----------
+# ---------- Fixtures ----------
 
-def empty_board(size):
-    """Create an empty Go board."""
-    return [[Stone.EMPTY for _ in range(size)] for _ in range(size)]
-
-
-def place_stones(board, stones):
-    """
-    Place stones on a board.
-
-    stones: list of (row, col, Stone)
-    """
-    for r, c, s in stones:
-        board[r][c] = s
+@pytest.fixture
+def empty_board_factory():
+    """Factory fixture for creating empty boards."""
+    def _empty_board(size):
+        return [[Stone.EMPTY for _ in range(size)] for _ in range(size)]
+    return _empty_board
 
 
-# ---------- Core test runner ----------
-
-def run_test_case(
-    trainer,
-    board_size,
-    original_stones,
-    user_stones,
-):
-    """
-    Force the trainer into DONE mode with predefined positions.
-
-    trainer         : GoMemoryTrainer instance
-    board_size      : int
-    original_stones : [(row, col, Stone), ...]
-    user_stones     : [(row, col, Stone), ...]
-    """
-
-    # --- Cancel timers if any ---
-    if getattr(trainer, "hide_timer_id", None):
-        trainer.root.after_cancel(trainer.hide_timer_id)
-
-    # --- Configure board ---
-    trainer.board_size = board_size
-    trainer.original_state = empty_board(board_size)
-    trainer.user_state = empty_board(board_size)
-
-    place_stones(trainer.original_state, original_stones)
-    place_stones(trainer.user_state, user_stones)
-
-    # --- Resize canvas ---
-    trainer.canvas_size = (
-        2 * trainer.margin + (board_size - 1) * trainer.cell_size
-    )
-    trainer.canvas.config(
-        width=trainer.canvas_size,
-        height=trainer.canvas_size,
-    )
-
-    # --- Force DONE phase ---
-    trainer.phase = Phase.DONE
-    trainer.score = score_position(
-        trainer.original_state,
-        trainer.user_state,
-    )
-
-    trainer.score_label.config(text=f"Score: {trainer.score}")
-    trainer._update_button_states()
-    trainer._draw()
+@pytest.fixture
+def place_stones_helper():
+    """Helper fixture for placing stones on a board."""
+    def _place_stones(board, stones):
+        for r, c, s in stones:
+            board[r][c] = s
+        return board
+    return _place_stones
 
 
-# ---------- Example test cases ----------
-
-def test_almost_correct_offset():
-    """
-    Generated: black at (3,3)
-    User:      black at (3,4)
-    Expect:    yellow plus + missing black ghost stone
-    """
-    trainer = GoMemoryTrainer()
-
-    original = [
-        (3, 3, Stone.BLACK),
-    ]
-
-    user = [
-        (3, 4, Stone.BLACK),
-    ]
-
-    run_test_case(
-        trainer=trainer,
-        board_size=9,
-        original_stones=original,
-        user_stones=user,
-    )
-
-    trainer.run()
+@pytest.fixture
+def trainer():
+    """Fixture providing a fresh GoMemoryTrainer instance."""
+    return GoMemoryTrainer()
 
 
-def test_wrong_color_same_place():
-    """
-    Generated: black at (4,4)
-    User:      white at (4,4)
-    Expect:    yellow plus (wrong color)
-    """
-    trainer = GoMemoryTrainer()
+# ---------- Scoring Tests (Unit Tests) ----------
 
-    original = [
-        (4, 4, Stone.BLACK),
-    ]
+class TestScoring:
+    """All scoring tests - no UI required."""
 
-    user = [
-        (4, 4, Stone.WHITE),
-    ]
+    @pytest.mark.parametrize("original,user,expected", [
+        (
+            [(0, 0, Stone.BLACK), (1, 1, Stone.WHITE)],
+            [(0, 0, Stone.BLACK), (1, 1, Stone.WHITE)],
+            0,
+        ),
+        ([(0, 0, Stone.BLACK)], [], -2),
+        ([], [(0, 0, Stone.BLACK)], -2),
+        ([(0, 0, Stone.BLACK)], [(0, 0, Stone.WHITE)], -1),
+        ([(3, 3, Stone.BLACK)], [(3, 4, Stone.BLACK)], -1),
+        ([(3, 3, Stone.WHITE)], [(4, 3, Stone.WHITE)], -1),
+        (
+            [(0, 0, Stone.BLACK), (1, 1, Stone.WHITE), (3, 3, Stone.BLACK)],
+            [(0, 0, Stone.BLACK), (2, 2, Stone.WHITE), (3, 4, Stone.BLACK)],
+            -5,
+        ),
+        (
+            [(0, 0, Stone.BLACK), (1, 1, Stone.BLACK), (2, 2, Stone.BLACK)],
+            [],
+            -6,
+        ),
+        (
+            [],
+            [(0, 0, Stone.BLACK), (1, 1, Stone.BLACK), (2, 2, Stone.BLACK)],
+            -6,
+        ),
+    ], ids=[
+        "all_correct",
+        "one_missing",
+        "one_hallucinated",
+        "wrong_color",
+        "offset_horizontal",
+        "offset_vertical",
+        "mixed",
+        "multiple_missing",
+        "multiple_hallucinated",
+    ])
+    def test_scoring(self, empty_board_factory, place_stones_helper, original, user, expected):
+        """Parametrized scoring tests."""
+        original_board = empty_board_factory(9)
+        user_board = empty_board_factory(9)
+        
+        place_stones_helper(original_board, original)
+        place_stones_helper(user_board, user)
+        
+        actual = score_position(original_board, user_board)
+        assert actual == expected, f"Score mismatch: expected {expected}, got {actual}"
 
-    run_test_case(
-        trainer=trainer,
-        board_size=9,
-        original_stones=original,
-        user_stones=user,
-    )
 
-    trainer.run()
+# ---------- Visual Tests (Integration Tests) ----------
 
+@pytest.mark.visual
+class TestVisual:
+    """Visual tests that render the UI. Skip with: pytest -m 'not visual'"""
 
-def test_hallucinated_and_missing():
-    """
-    Generated: white at (5,5)
-    User:      black at (2,2)
-    Expect:    red X at (2,2), off-white ghost at (5,5)
-    """
-    trainer = GoMemoryTrainer()
+    def _setup_trainer(self, trainer, board_size, original_stones, user_stones):
+        """Helper to configure trainer for visual testing."""
+        if getattr(trainer, "hide_timer_id", None):
+            trainer.root.after_cancel(trainer.hide_timer_id)
 
-    original = [
-        (5, 5, Stone.WHITE),
-    ]
+        trainer.board_size = board_size
+        trainer.original_state = [[Stone.EMPTY for _ in range(board_size)] for _ in range(board_size)]
+        trainer.user_state = [[Stone.EMPTY for _ in range(board_size)] for _ in range(board_size)]
 
-    user = [
-        (2, 2, Stone.BLACK),
-    ]
+        for r, c, s in original_stones:
+            trainer.original_state[r][c] = s
+        for r, c, s in user_stones:
+            trainer.user_state[r][c] = s
 
-    run_test_case(
-        trainer=trainer,
-        board_size=9,
-        original_stones=original,
-        user_stones=user,
-    )
+        trainer.canvas_size = (
+            2 * trainer.margin + (board_size - 1) * trainer.cell_size
+        )
+        trainer.canvas.config(width=trainer.canvas_size, height=trainer.canvas_size)
 
-    trainer.run()
+        trainer.phase = Phase.DONE
+        trainer.score = score_position(trainer.original_state, trainer.user_state)
+        trainer.score_label.config(text=f"Score: {trainer.score}")
+        trainer._update_button_states()
+        trainer._draw()
 
+    def test_correct_position(self, trainer):
+        """Render: two correct stones with green checkmarks."""
+        self._setup_trainer(
+            trainer,
+            board_size=9,
+            original_stones=[(3, 3, Stone.BLACK), (5, 5, Stone.WHITE)],
+            user_stones=[(3, 3, Stone.BLACK), (5, 5, Stone.WHITE)],
+        )
+        trainer.run()
 
-# ---------- Entry point ----------
+    def test_almost_correct_offset(self, trainer):
+        """Render: stone offset by one with yellow marker."""
+        self._setup_trainer(
+            trainer,
+            board_size=9,
+            original_stones=[(3, 3, Stone.BLACK)],
+            user_stones=[(3, 4, Stone.BLACK)],
+        )
+        trainer.run()
+
+    def test_wrong_color_same_place(self, trainer):
+        """Render: wrong color stone with yellow marker."""
+        self._setup_trainer(
+            trainer,
+            board_size=9,
+            original_stones=[(4, 4, Stone.BLACK)],
+            user_stones=[(4, 4, Stone.WHITE)],
+        )
+        trainer.run()
+
+    def test_hallucinated_and_missing(self, trainer):
+        """Render: hallucinated stone (red X) and missing ghost stone."""
+        self._setup_trainer(
+            trainer,
+            board_size=9,
+            original_stones=[(5, 5, Stone.WHITE)],
+            user_stones=[(2, 2, Stone.BLACK)],
+        )
+        trainer.run()
+
 
 if __name__ == "__main__":
-    # Choose which test to run:
-    test_almost_correct_offset()
-    test_wrong_color_same_place()
-    test_hallucinated_and_missing()
+    pytest.main([__file__, "-v"])
